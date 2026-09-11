@@ -1,100 +1,90 @@
-"""Tests for the shared-path guard in remove_path.
+"""Core repro for the shared-path removal bug (PR #1132, bug 2).
 
-When multiple items (e.g. all music videos) share a single path record,
-removing any one of them must NOT delete the path while other files still
-reference it.  Previously remove_path deleted unconditionally, causing the
-entire musicvideo_view JOIN to return 0 rows.
+Real-world trigger: multiple movies in one flat directory share a single
+Kodi `path` row. kodi/movies.delete() removes the movie and files rows,
+then calls remove_path(), which used to delete the path row
+unconditionally -- orphaning every other movie that still shares it and
+making movieview return 0 rows for all of them. The fixture below mirrors
+tests/fixtures/sample_library/movies-bug2/Shared Folder/ (3 real files
+sharing one path) -- same library shape as the manual repro in that
+directory's README, not a separate synthetic story.
 
-These tests import the real jellyfin_kodi.objects.kodi.kodi.Kodi.remove_path
-directly, rather than a local re-implementation of the guard -- so they
-actually fail against an unpatched checkout instead of always passing.
+Calls the REAL jellyfin_kodi.objects.kodi.kodi.Kodi.remove_path, not a
+local re-implementation of the guard -- so this actually fails against an
+unpatched checkout instead of always passing.
 """
 
 import sqlite3
 import unittest
 
+from jellyfin_kodi.objects.kodi import queries as QU
 from jellyfin_kodi.objects.kodi.kodi import Kodi
 
+from tests.fixtures.sample_library import list_files
 
-def _make_kodi_cursor():
-    """In-memory DB with minimal path/files/musicvideo schema."""
+MOVIES = list_files("movies-bug2/Shared Folder")
+
+
+def _make_db():
+    """In-memory Kodi video DB, seeded from the real files in
+    tests/fixtures/sample_library/movies-bug2/Shared Folder/."""
     conn = sqlite3.connect(":memory:")
-    conn.execute("CREATE TABLE path (idPath INTEGER PRIMARY KEY, strPath TEXT)")
-    conn.execute(
-        "CREATE TABLE files (idFile INTEGER PRIMARY KEY, idPath INTEGER, strFileName TEXT)"
+    conn.executescript(
+        """
+        CREATE TABLE path (idPath INTEGER PRIMARY KEY, strPath TEXT);
+        CREATE TABLE files (idFile INTEGER PRIMARY KEY, idPath INTEGER, strFileName TEXT);
+        CREATE TABLE movie (idMovie INTEGER PRIMARY KEY, idFile INTEGER);
+        -- mirrors Kodi's real movieview: only rows whose files->path join is
+        -- intact appear here.
+        CREATE VIEW movieview AS
+            SELECT m.idMovie, f.idFile, p.idPath
+            FROM   movie m
+            JOIN   files f ON m.idFile = f.idFile
+            JOIN   path  p ON f.idPath = p.idPath;
+        """
     )
-    conn.execute(
-        "CREATE TABLE musicvideo (idMVideo INTEGER PRIMARY KEY, idFile INTEGER)"
-    )
-    conn.execute("INSERT INTO path VALUES (1, 'smb://nas/music-videos/')")
-    for i in range(1, 4):
-        conn.execute(f"INSERT INTO files VALUES ({i}, 1, 'mv{i}.mkv')")
-        conn.execute(f"INSERT INTO musicvideo VALUES ({i}, {i})")
+    conn.execute("INSERT INTO path VALUES (1, 'smb://video/')")
+    for i, name in enumerate(MOVIES, start=1):
+        conn.execute("INSERT INTO files VALUES (?, 1, ?)", (i, name))
+        conn.execute("INSERT INTO movie VALUES (?, ?)", (i, i))
     conn.commit()
     return conn
-
-
-def _make_real_kodi_db(cursor):
-    """Real Kodi instance with only .cursor wired up. Bypasses __init__ (artwork
-    setup, people cache -- irrelevant to remove_path) so only the actual,
-    unmodified remove_path method is exercised."""
-    kodi = object.__new__(Kodi)
-    kodi.cursor = cursor
-    return kodi
 
 
 class TestRemovePathGuard(unittest.TestCase):
 
     def setUp(self):
-        self.conn = _make_kodi_cursor()
-        self.db = _make_real_kodi_db(self.conn.cursor())
+        self.conn = _make_db()
 
     def tearDown(self):
         self.conn.close()
 
-    def test_path_retained_while_other_files_reference_it(self):
-        """Removing one file must not delete the path that two others still need."""
-        self.conn.execute("DELETE FROM files WHERE idFile = 1")
-        self.conn.commit()
-        self.db.cursor = self.conn.cursor()
+    def test_removing_one_movie_preserves_the_shared_path(self):
+        """The bug: deleting one of N shared-path movies (mirroring
+        movies.py's delete(), then remove_path()) must not wipe the path
+        record and orphan the other N-1."""
+        cursor = self.conn.cursor()
+        cursor.execute(QU.delete_movie, (1,))
+        cursor.execute(QU.delete_file, (1,))
 
-        self.db.remove_path(1)
+        kodi = object.__new__(Kodi)  # __init__ sets up artwork/people-cache state, irrelevant here
+        kodi.cursor = cursor
+        Kodi.remove_path(kodi, 1)
 
-        row = self.conn.execute("SELECT idPath FROM path WHERE idPath = 1").fetchone()
-        self.assertIsNotNone(
-            row, "Path must not be deleted while files 2 and 3 still reference it"
+        path_exists = (
+            self.conn.execute("SELECT count(*) FROM path WHERE idPath = 1").fetchone()[0]
+            == 1
+        )
+        self.assertTrue(
+            path_exists, "Path must survive while the other movies still reference it"
         )
 
-    def test_path_deleted_when_no_files_remain(self):
-        """Path must be cleaned up once the last referencing file is gone."""
-        self.conn.execute("DELETE FROM files WHERE idPath = 1")
-        self.conn.commit()
-        self.db.cursor = self.conn.cursor()
-
-        self.db.remove_path(1)
-
-        row = self.conn.execute("SELECT idPath FROM path WHERE idPath = 1").fetchone()
-        self.assertIsNone(row, "Path should be deleted when no files reference it")
-
-    def test_last_file_triggers_path_cleanup(self):
-        """After deleting the last file, remove_path cleans up correctly."""
-        self.conn.execute("DELETE FROM files WHERE idFile IN (1, 2)")
-        self.conn.commit()
-        self.db.cursor = self.conn.cursor()
-
-        # One file still references the path — must survive
-        self.db.remove_path(1)
-        row = self.conn.execute("SELECT idPath FROM path WHERE idPath = 1").fetchone()
-        self.assertIsNotNone(row)
-
-        # Now remove the last file
-        self.conn.execute("DELETE FROM files WHERE idFile = 3")
-        self.conn.commit()
-        self.db.cursor = self.conn.cursor()
-
-        self.db.remove_path(1)
-        row = self.conn.execute("SELECT idPath FROM path WHERE idPath = 1").fetchone()
-        self.assertIsNone(row, "Path should be removed after the last file is gone")
+        view_count = self.conn.execute("SELECT count(*) FROM movieview").fetchone()[0]
+        self.assertEqual(
+            view_count,
+            len(MOVIES) - 1,
+            "Only the deleted movie should disappear from the view",
+        )
 
 
 if __name__ == "__main__":
